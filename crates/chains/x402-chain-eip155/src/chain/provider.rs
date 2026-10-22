@@ -24,6 +24,9 @@ use x402_types::chain::{ChainId, ChainProviderOps, FromConfig};
 #[cfg(feature = "telemetry")]
 use tracing::Instrument;
 
+use crate::chain::authorization_use::{
+    AUTHORIZATION_USE_LOOKBACK, AuthorizationUse, Eip3009Authorization, query_authorization_use,
+};
 use crate::chain::config::{Eip155ChainConfig, RpcConfig};
 use crate::chain::pending_nonce_manager::PendingNonceManager;
 use crate::chain::pending_settlement::{InMemoryPendingSettlementStore, PendingSettlementStore};
@@ -99,6 +102,8 @@ pub struct Eip155ChainProvider {
     nonce_manager: PendingNonceManager,
     /// Settlements broadcast without a known outcome, for the resource server's retry.
     pending_settlements: Arc<InMemoryPendingSettlementStore>,
+    /// Whether [`Eip155MetaTransactionProvider::find_authorization_use`] looks on chain.
+    reconcile_used_authorizations: bool,
 }
 
 impl Eip155ChainProvider {
@@ -294,6 +299,7 @@ impl FromConfig<Eip155ChainConfig> for Eip155ChainProvider {
             signer_cursor,
             nonce_manager,
             pending_settlements: Arc::new(InMemoryPendingSettlementStore::default()),
+            reconcile_used_authorizations: config.reconcile_used_authorizations(),
         })
     }
 }
@@ -444,6 +450,38 @@ impl Eip155MetaTransactionProvider for Eip155ChainProvider {
         )
         .await
     }
+
+    /// Looks the use of `authorization` up on chain when `reconcile_used_authorizations` is
+    /// set in the chain's configuration, within [`AUTHORIZATION_USE_LOOKBACK`], then waits for
+    /// the receipt of the transaction found as [`Self::find_receipt`] does. A failed lookup counts
+    /// as not found.
+    async fn find_authorization_use(
+        &self,
+        authorization: Eip3009Authorization,
+    ) -> Option<AuthorizationUse> {
+        if !self.reconcile_used_authorizations {
+            return None;
+        }
+        let tx_hash = match query_authorization_use(
+            &self.inner,
+            &authorization,
+            AUTHORIZATION_USE_LOOKBACK,
+        )
+        .await
+        {
+            Ok(tx_hash) => tx_hash?,
+            Err(error) => {
+                #[cfg(feature = "telemetry")]
+                tracing::warn!(%error, nonce = %authorization.nonce, "Lookup of a used authorization failed");
+                let _ = error;
+                return None;
+            }
+        };
+        Some(AuthorizationUse {
+            tx_hash,
+            receipt: self.find_receipt(tx_hash).await,
+        })
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -570,6 +608,18 @@ pub trait Eip155MetaTransactionProvider {
         let _ = tx_hash;
         std::future::ready(None)
     }
+
+    /// Looks up the transaction that used an ERC-3009 authorization, and its receipt, for a
+    /// settle request that has no pending-settlement entry and failed to settle: if the
+    /// authorization was already used, that transaction may be the request's settlement. `None`
+    /// if it was not found. The default looks nothing up, so such a request fails as before.
+    fn find_authorization_use(
+        &self,
+        authorization: Eip3009Authorization,
+    ) -> impl Future<Output = Option<AuthorizationUse>> + Send {
+        let _ = authorization;
+        std::future::ready(None)
+    }
 }
 
 impl<T: Eip155MetaTransactionProvider> Eip155MetaTransactionProvider for Arc<T> {
@@ -600,6 +650,13 @@ impl<T: Eip155MetaTransactionProvider> Eip155MetaTransactionProvider for Arc<T> 
         tx_hash: TxHash,
     ) -> impl Future<Output = Option<TransactionReceipt>> + Send {
         (**self).find_receipt(tx_hash)
+    }
+
+    fn find_authorization_use(
+        &self,
+        authorization: Eip3009Authorization,
+    ) -> impl Future<Output = Option<AuthorizationUse>> + Send {
+        (**self).find_authorization_use(authorization)
     }
 }
 
@@ -701,5 +758,140 @@ mod tests {
         assert_eq!(receipt, None);
         assert_eq!(calls.load(Ordering::Relaxed), 11);
         assert_eq!(start.elapsed(), Duration::from_secs(10));
+    }
+
+    mod authorization_use {
+        use super::*;
+        use crate::chain::authorization_use::tests::{
+            ASSET, PAYER, TX, abi_bool, authorization, authorization_used_log, block,
+        };
+        use alloy_primitives::b256;
+        use alloy_transport::mock::Asserter;
+
+        /// A provider on a mock RPC that answers from `asserter`, in order.
+        fn provider(
+            asserter: &Asserter,
+            reconcile_used_authorizations: bool,
+        ) -> Eip155ChainProvider {
+            let signer = PrivateKeySigner::from_bytes(&b256!(
+                "0xcafe000000000000000000000000000000000000000000000000000000000001"
+            ))
+            .unwrap();
+            let signer_address = signer.address();
+            let nonce_manager = PendingNonceManager::default();
+            let filler = JoinFill::new(
+                GasFiller::default(),
+                JoinFill::new(
+                    BlobGasFiller::default(),
+                    JoinFill::new(
+                        NonceFiller::new(nonce_manager.clone()),
+                        ChainIdFiller::default(),
+                    ),
+                ),
+            );
+            let inner: InnerProvider = ProviderBuilder::default()
+                .filler(filler)
+                .wallet(EthereumWallet::from(signer))
+                .connect_client(RpcClient::mocked(asserter.clone()));
+            Eip155ChainProvider {
+                chain: Eip155ChainReference::new(84532),
+                eip1559: true,
+                flashblocks: false,
+                receipt_timeout_secs: 3,
+                inner,
+                signer_addresses: Arc::new(vec![signer_address]),
+                signer_cursor: Arc::new(AtomicUsize::new(0)),
+                nonce_manager,
+                pending_settlements: Arc::new(InMemoryPendingSettlementStore::default()),
+                reconcile_used_authorizations,
+            }
+        }
+
+        fn receipt_of(tx_hash: TxHash) -> serde_json::Value {
+            serde_json::json!({
+                "type": "0x2",
+                "status": "0x1",
+                "cumulativeGasUsed": "0x1",
+                "logs": [authorization_used_log(100)],
+                "logsBloom": format!("0x{}", "0".repeat(512)),
+                "transactionHash": tx_hash,
+                "transactionIndex": "0x0",
+                "blockHash": B256::with_last_byte(2),
+                "blockNumber": "0x64",
+                "gasUsed": "0x1",
+                "effectiveGasPrice": "0x1",
+                "from": Address::ZERO,
+                "to": ASSET,
+                "contractAddress": null
+            })
+        }
+
+        /// The answers for an authorization used in block 100, the latest block, which is
+        /// also where the range starts since the authorization became valid at its time.
+        fn push_used_in_latest_block(asserter: &Asserter) {
+            asserter.push_success(&abi_bool(true));
+            asserter.push_success(&block(100, 1_000));
+            asserter.push_success(&vec![authorization_used_log(100)]);
+            asserter.push_success(&receipt_of(TX));
+        }
+
+        #[tokio::test]
+        async fn test_lookup_is_off_unless_configured() {
+            let asserter = Asserter::new();
+            push_used_in_latest_block(&asserter);
+            let found = provider(&asserter, false)
+                .find_authorization_use(authorization(1_000, 2_000))
+                .await;
+            assert!(found.is_none());
+            assert_eq!(asserter.read_q().len(), 4, "no RPC call was made");
+        }
+
+        #[tokio::test]
+        async fn test_lookup_finds_the_transaction_and_its_receipt() {
+            let asserter = Asserter::new();
+            push_used_in_latest_block(&asserter);
+            let found = provider(&asserter, true)
+                .find_authorization_use(authorization(1_000, 2_000))
+                .await
+                .expect("the transaction that used the authorization");
+            assert_eq!(found.tx_hash, TX);
+            let receipt = found.receipt.expect("its receipt");
+            assert_eq!(receipt.transaction_hash, TX);
+            assert_eq!(receipt.logs()[0].topics()[1], PAYER.into_word());
+            assert!(asserter.read_q().is_empty());
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn test_transaction_found_without_its_receipt_comes_back_with_its_hash() {
+            let asserter = Asserter::new();
+            asserter.push_success(&abi_bool(true));
+            asserter.push_success(&block(100, 1_000));
+            asserter.push_success(&vec![authorization_used_log(100)]);
+            // Every receipt lookup in the wait (receipt_timeout_secs, 3 s) finds nothing.
+            for _ in 0..4 {
+                asserter.push_success(&serde_json::Value::Null);
+            }
+            let found = provider(&asserter, true)
+                .find_authorization_use(authorization(1_000, 2_000))
+                .await
+                .expect("the transaction that used the authorization");
+            assert_eq!(found.tx_hash, TX);
+            assert!(found.receipt.is_none());
+            assert!(
+                asserter.read_q().is_empty(),
+                "looked the receipt up 4 times"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn test_failed_lookup_counts_as_not_found() {
+            let asserter = Asserter::new();
+            asserter.push_success(&abi_bool(true));
+            asserter.push_failure_msg("no backend is currently healthy to serve traffic");
+            let found = provider(&asserter, true)
+                .find_authorization_use(authorization(1_000, 2_000))
+                .await;
+            assert!(found.is_none());
+        }
     }
 }

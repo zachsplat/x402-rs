@@ -38,8 +38,8 @@ use tracing_core::Level;
 use crate::V1Eip155Exact;
 use crate::chain::{
     EOASignature, EOASignatureExt, Eip155ChainReference, Eip155MetaTransactionProvider,
-    MetaTransaction, MetaTransactionSendError, PendingSettlement, pending_settlement_key,
-    settle_request_hash,
+    Eip3009Authorization, MetaTransaction, MetaTransactionSendError, PendingSettlement,
+    pending_settlement_key, settle_request_hash, settlement_of_authorization,
 };
 use crate::v1_eip155_exact::{
     ExactScheme, PaymentRequirementsExtra, TransferWithAuthorization, types,
@@ -147,20 +147,24 @@ where
             payload.payload.authorization.from,
             requirements.pay_to,
         );
+        let authorization =
+            authorization_to_reconcile(self.provider.chain(), payload, requirements);
         let tx_hash = settle_with_pending_store(
             &self.provider,
             &payload.payload.signature,
             settle_request_hash(payload, requirements),
             &payload.network,
-            || async {
-                let (contract, payment, eip712_domain) = assert_valid_payment(
-                    self.provider.inner(),
-                    self.provider.chain(),
-                    payload,
-                    requirements,
-                )
-                .await?;
-                settle_payment(&self.provider, &contract, &payment, &eip712_domain).await
+            || {
+                settle_or_find_used_authorization(&self.provider, authorization, async {
+                    let (contract, payment, eip712_domain) = assert_valid_payment(
+                        self.provider.inner(),
+                        self.provider.chain(),
+                        payload,
+                        requirements,
+                    )
+                    .await?;
+                    settle_payment(&self.provider, &contract, &payment, &eip712_domain).await
+                })
             },
         )
         .await?;
@@ -338,6 +342,23 @@ async fn assert_valid_payment<'a, P: Provider>(
     };
 
     Ok((contract, payment, domain))
+}
+
+/// The authorization of a settle request, to look up on chain if settling it fails, when the
+/// request matches its requirements on `chain` (networks, recipient and amount). `None` for a
+/// request that does not: it fails as before, without a lookup.
+fn authorization_to_reconcile(
+    chain: &Eip155ChainReference,
+    payload: &types::PaymentPayload,
+    requirements: &types::PaymentRequirements,
+) -> Option<Eip3009Authorization> {
+    let chain_id: ChainId = chain.into();
+    let authorization = &payload.payload.authorization;
+    let matches = ChainId::from_network_name(&payload.network).as_ref() == Some(&chain_id)
+        && ChainId::from_network_name(&requirements.network).as_ref() == Some(&chain_id)
+        && authorization.to == requirements.pay_to
+        && authorization.value >= requirements.max_amount_required;
+    matches.then(|| Eip3009Authorization::new(requirements.asset, authorization))
 }
 
 /// Validates that the current time is within the `validAfter` and `validBefore` bounds.
@@ -1041,7 +1062,8 @@ where
     };
     let key = pending_settlement_key(signature);
     // Taken before reconciling, so a concurrent copy of the same request does not reconcile too:
-    // it settles from scratch and fails on the used authorization.
+    // it settles from scratch and fails on the used authorization, unless the provider answers
+    // used authorizations from the chain (see `settle_or_find_used_authorization`).
     if let Some(tx_hash) = store.take(&key, &request_hash).await {
         #[cfg(feature = "telemetry")]
         tracing::info!(tx = %tx_hash, "Retried settlement: reconciling with the transaction already broadcast");
@@ -1082,6 +1104,72 @@ where
             .await;
     }
     result.map_err(|e| e.into_settlement_error(network))
+}
+
+/// Runs `settle` and, if it fails because the request's ERC-3009 authorization was already
+/// used, answers with the transaction that used it.
+///
+/// This is for a settle request that has no pending-settlement entry: the retry of a
+/// settlement whose entry was kept by another instance, or lost in a restart. `authorization`
+/// is the request's authorization (see `authorization_to_reconcile`), or `None` for no lookup.
+/// When `settle` fails with any error but [`Eip155ExactError::ReceiptUnavailable`] (which
+/// leaves a pending settlement of its own), the provider looks the authorization's use up
+/// ([`Eip155MetaTransactionProvider::find_authorization_use`], which looks nothing up unless
+/// the provider enables it). The transaction found is the request's settlement if it
+/// succeeded, was sent by one of the provider's signers, and made the asset emit
+/// `AuthorizationUsed` for the authorization and a `Transfer` of its value from the payer to the
+/// recipient ([`settlement_of_authorization`]): its hash is then the answer. If its receipt
+/// could not be fetched, the answer is
+/// [`Eip155ExactError::AuthorizationUseReceiptUnavailable`] with its hash, which `/settle`
+/// answers as `settlement_pending` but which is not recorded in the pending-settlement store,
+/// so a later retry is checked again. Otherwise, as when nothing is found, the error of
+/// `settle` is.
+///
+/// Permit2 payments are not covered: their nonces are in the Permit2 contract.
+pub async fn settle_or_find_used_authorization<P, Fut>(
+    provider: &P,
+    authorization: Option<Eip3009Authorization>,
+    settle: Fut,
+) -> Result<TxHash, Eip155ExactError>
+where
+    P: Eip155MetaTransactionProvider + ChainProviderOps,
+    Fut: Future<Output = Result<TxHash, Eip155ExactError>>,
+{
+    let error = match settle.await {
+        Err(error) if !matches!(error, Eip155ExactError::ReceiptUnavailable { .. }) => error,
+        result => return result,
+    };
+    let Some(authorization) = authorization else {
+        return Err(error);
+    };
+    let Some(found) = provider.find_authorization_use(authorization).await else {
+        return Err(error);
+    };
+    let Some(receipt) = found.receipt else {
+        #[cfg(feature = "telemetry")]
+        tracing::info!(tx = %found.tx_hash, nonce = %authorization.nonce, "The authorization was used by a transaction whose receipt is unavailable");
+        return Err(Eip155ExactError::AuthorizationUseReceiptUnavailable(
+            found.tx_hash,
+        ));
+    };
+    let signers = provider
+        .signer_addresses()
+        .iter()
+        .filter_map(|signer| signer.parse().ok())
+        .collect::<Vec<Address>>();
+    match settlement_of_authorization(&receipt, &authorization, &signers) {
+        Ok(tx_hash) => {
+            #[cfg(feature = "telemetry")]
+            tracing::info!(tx = %tx_hash, nonce = %authorization.nonce, "Settle request answered with the transaction that used its authorization");
+            Ok(tx_hash)
+        }
+        Err(mismatch) => {
+            #[cfg(feature = "telemetry")]
+            tracing::warn!(tx = %receipt.transaction_hash, nonce = %authorization.nonce, %mismatch, "Transaction that used the authorization is not this request's settlement");
+            let _ = mismatch;
+            Err(error)
+        }
+    }
 }
 
 /// Extracts the transaction hash from a confirmed receipt, or returns an error if the
@@ -1129,6 +1217,11 @@ pub enum Eip155ExactError {
         #[source]
         source: PendingTransactionError,
     },
+    /// A settle request with no pending-settlement entry found the transaction that used its
+    /// authorization, but not its receipt, so whether it is the request's settlement is not
+    /// known yet.
+    #[error("The authorization was used by transaction {0}, whose receipt could not be fetched")]
+    AuthorizationUseReceiptUnavailable(TxHash),
     #[error("Transaction {0} reverted")]
     TransactionReverted(TxHash),
     #[error("Contract call failed: {0}")]
@@ -1140,12 +1233,15 @@ pub enum Eip155ExactError {
 impl Eip155ExactError {
     /// Converts an error from a settlement on `network` into the error `/settle` answers with.
     ///
-    /// [`Eip155ExactError::ReceiptUnavailable`] becomes
+    /// [`Eip155ExactError::ReceiptUnavailable`] and
+    /// [`Eip155ExactError::AuthorizationUseReceiptUnavailable`] become
     /// [`X402SchemeFacilitatorError::SettlementPending`], which keeps the transaction hash and
     /// the network so the caller can reconcile on chain. Every other error converts as
     /// [`From`] does.
     pub fn into_settlement_error(self, network: &str) -> X402SchemeFacilitatorError {
-        if let Eip155ExactError::ReceiptUnavailable { tx_hash, .. } = &self {
+        if let Eip155ExactError::ReceiptUnavailable { tx_hash, .. }
+        | Eip155ExactError::AuthorizationUseReceiptUnavailable(tx_hash) = &self
+        {
             return X402SchemeFacilitatorError::SettlementPending {
                 network: network.to_string(),
                 transaction: tx_hash.to_string(),
@@ -1164,6 +1260,9 @@ impl From<Eip155ExactError> for X402SchemeFacilitatorError {
             // Without the network a pending answer is incomplete; settlement code paths use
             // `into_settlement_error` instead. The message still names the transaction.
             Eip155ExactError::ReceiptUnavailable { .. } => Self::OnchainFailure(value.to_string()),
+            Eip155ExactError::AuthorizationUseReceiptUnavailable(_) => {
+                Self::OnchainFailure(value.to_string())
+            }
             Eip155ExactError::TransactionReverted(_) => Self::OnchainFailure(value.to_string()),
             Eip155ExactError::ContractCall(_) => Self::OnchainFailure(value.to_string()),
             Eip155ExactError::PaymentVerification(e) => Self::PaymentVerification(e),
@@ -1308,8 +1407,12 @@ mod tests {
 
     mod pending_store {
         use super::*;
-        use crate::chain::{InMemoryPendingSettlementStore, PendingSettlementStore};
+        use crate::chain::{
+            AuthorizationUse, InMemoryPendingSettlementStore, PendingSettlementStore,
+        };
+        use alloy_primitives::address;
         use alloy_provider::RootProvider;
+        use alloy_sol_types::SolEvent;
         use std::sync::Arc;
         use std::sync::Mutex;
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -1322,12 +1425,15 @@ mod tests {
         const OTHER_TX: TxHash =
             b256!("0x4444444444444444444444444444444444444444444444444444444444444444");
 
-        /// A provider whose receipt lookup answers what the test sets, with an optional store.
+        /// A provider whose receipt and authorization-use lookups answer what the test sets,
+        /// with an optional store and one signer.
         #[derive(Debug)]
         struct MockProvider {
             store: Option<InMemoryPendingSettlementStore>,
             receipt: Mutex<Option<TransactionReceipt>>,
             receipt_lookups: AtomicU32,
+            authorization_use: Mutex<Option<AuthorizationUse>>,
+            authorization_lookups: Mutex<Vec<Eip3009Authorization>>,
             inner: RootProvider,
             chain: Eip155ChainReference,
         }
@@ -1338,9 +1444,29 @@ mod tests {
                     store: store.then(InMemoryPendingSettlementStore::default),
                     receipt: Mutex::new(None),
                     receipt_lookups: AtomicU32::new(0),
+                    authorization_use: Mutex::new(None),
+                    authorization_lookups: Mutex::new(Vec::new()),
                     inner: RootProvider::new_http("http://127.0.0.1:9".parse().unwrap()),
                     chain: Eip155ChainReference::new(84532),
                 }
+            }
+
+            fn set_authorization_use(&self, receipt: Option<TransactionReceipt>) {
+                *self.authorization_use.lock().unwrap() = receipt.map(|receipt| AuthorizationUse {
+                    tx_hash: receipt.transaction_hash,
+                    receipt: Some(receipt),
+                });
+            }
+
+            fn set_authorization_use_without_receipt(&self, tx_hash: TxHash) {
+                *self.authorization_use.lock().unwrap() = Some(AuthorizationUse {
+                    tx_hash,
+                    receipt: None,
+                });
+            }
+
+            fn authorization_lookups(&self) -> Vec<Eip3009Authorization> {
+                self.authorization_lookups.lock().unwrap().clone()
             }
 
             fn set_receipt(&self, receipt: Option<TransactionReceipt>) {
@@ -1380,6 +1506,27 @@ mod tests {
             async fn find_receipt(&self, _tx_hash: TxHash) -> Option<TransactionReceipt> {
                 self.receipt_lookups.fetch_add(1, Ordering::Relaxed);
                 self.receipt.lock().unwrap().clone()
+            }
+
+            async fn find_authorization_use(
+                &self,
+                authorization: Eip3009Authorization,
+            ) -> Option<AuthorizationUse> {
+                self.authorization_lookups
+                    .lock()
+                    .unwrap()
+                    .push(authorization);
+                self.authorization_use.lock().unwrap().clone()
+            }
+        }
+
+        impl ChainProviderOps for MockProvider {
+            fn signer_addresses(&self) -> Vec<String> {
+                vec![SIGNER.to_string()]
+            }
+
+            fn chain_id(&self) -> ChainId {
+                self.chain.into()
             }
         }
 
@@ -1575,6 +1722,484 @@ mod tests {
             provider.set_receipt(Some(receipt(TX_HASH, true)));
             assert!(provider.find_receipt(TX_HASH).await.is_some());
             assert_eq!(provider.receipt_lookups.load(Ordering::Relaxed), 1);
+            provider.set_authorization_use(Some(settlement(|_| {})));
+            assert!(
+                provider
+                    .find_authorization_use(authorization())
+                    .await
+                    .is_some()
+            );
+            assert_eq!(provider.authorization_lookups(), vec![authorization()]);
+        }
+
+        // ---- A settle request with no store entry whose authorization is already used ----
+
+        const ASSET: Address = address!("0x036CbD53842c5426634e7929541eC2318f3dCF7e");
+        const PAYER: Address = address!("0x1111111111111111111111111111111111111111");
+        const SELLER: Address = address!("0x2222222222222222222222222222222222222222");
+        const SIGNER: Address = address!("0x3333333333333333333333333333333333333333");
+        const NONCE: B256 =
+            b256!("0x6666666666666666666666666666666666666666666666666666666666666666");
+        const VALUE: u64 = 10_000;
+        /// The transaction that used the authorization, found on chain.
+        const FOUND_TX: TxHash =
+            b256!("0x7777777777777777777777777777777777777777777777777777777777777777");
+
+        fn authorization() -> Eip3009Authorization {
+            Eip3009Authorization {
+                asset: ASSET,
+                from: PAYER,
+                to: SELLER,
+                value: U256::from(VALUE),
+                valid_after: UnixTimestamp::from_secs(1_000),
+                valid_before: UnixTimestamp::from_secs(2_000),
+                nonce: NONCE,
+            }
+        }
+
+        /// A change to the JSON of a [`settlement`] receipt.
+        type ReceiptChange = Box<dyn Fn(&mut serde_json::Value)>;
+
+        /// The receipt of a settlement of [`authorization`] by [`SIGNER`], as `transferWithAuthorization`
+        /// leaves it, after `change` has altered it.
+        fn settlement(change: impl FnOnce(&mut serde_json::Value)) -> TransactionReceipt {
+            let log = |index: u64, topics: serde_json::Value, data: String| {
+                serde_json::json!({
+                    "address": ASSET,
+                    "topics": topics,
+                    "data": data,
+                    "blockHash": "0x1111111111111111111111111111111111111111111111111111111111111111",
+                    "blockNumber": "0x10",
+                    "transactionHash": FOUND_TX,
+                    "transactionIndex": "0x0",
+                    "logIndex": format!("0x{index:x}"),
+                    "removed": false
+                })
+            };
+            let mut receipt = serde_json::json!({
+                "type": "0x2",
+                "status": "0x1",
+                "cumulativeGasUsed": "0x1",
+                "logs": [
+                    log(
+                        0,
+                        serde_json::json!([
+                            IEIP3009::AuthorizationUsed::SIGNATURE_HASH,
+                            PAYER.into_word(),
+                            NONCE
+                        ]),
+                        "0x".to_string()
+                    ),
+                    log(
+                        1,
+                        serde_json::json!([
+                            IEIP3009::Transfer::SIGNATURE_HASH,
+                            PAYER.into_word(),
+                            SELLER.into_word()
+                        ]),
+                        format!("0x{VALUE:064x}")
+                    )
+                ],
+                "logsBloom": format!("0x{}", "0".repeat(512)),
+                "transactionHash": FOUND_TX,
+                "transactionIndex": "0x0",
+                "blockHash": "0x1111111111111111111111111111111111111111111111111111111111111111",
+                "blockNumber": "0x10",
+                "gasUsed": "0x1",
+                "effectiveGasPrice": "0x1",
+                "from": SIGNER,
+                "to": ASSET,
+                "contractAddress": null
+            });
+            change(&mut receipt);
+            serde_json::from_value(receipt).unwrap()
+        }
+
+        /// What settling the request from scratch gives once its authorization is used: the gas
+        /// estimate of the new transaction reverts.
+        fn authorization_used_error() -> Eip155ExactError {
+            Eip155ExactError::Transport(TransportErrorKind::custom_str(
+                "server returned an error response: error code 3: execution reverted: FiatTokenV2: authorization is used or canceled",
+            ))
+        }
+
+        /// Settles a request through the store and the lookup, as the EIP-3009 settle paths do;
+        /// `outcome` is what settling it from scratch gives.
+        async fn settle_eip3009(
+            provider: &MockProvider,
+            authorization: Option<Eip3009Authorization>,
+            sends: &AtomicU32,
+            outcome: impl FnOnce() -> Result<TxHash, Eip155ExactError>,
+        ) -> Result<TxHash, X402SchemeFacilitatorError> {
+            settle_with_pending_store(provider, SIGNATURE, Some(REQUEST), "eip155:84532", || {
+                sends.fetch_add(1, Ordering::Relaxed);
+                settle_or_find_used_authorization(provider, authorization, async move { outcome() })
+            })
+            .await
+        }
+
+        fn assert_authorization_used_failure(error: &X402SchemeFacilitatorError) {
+            assert!(
+                matches!(
+                    error,
+                    X402SchemeFacilitatorError::OnchainFailure(message)
+                        if message.contains("authorization is used or canceled")
+                ),
+                "expected the used-authorization failure, got {error:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_used_authorization_without_a_store_entry_answers_the_transaction_found() {
+            let provider = MockProvider::new(true);
+            provider.set_authorization_use(Some(settlement(|_| {})));
+            let sends = AtomicU32::new(0);
+            let tx_hash = settle_eip3009(&provider, Some(authorization()), &sends, || {
+                Err(authorization_used_error())
+            })
+            .await
+            .unwrap();
+            assert_eq!(tx_hash, FOUND_TX);
+            assert_eq!(provider.authorization_lookups(), vec![authorization()]);
+            assert_eq!(sends.load(Ordering::Relaxed), 1);
+            assert_eq!(provider.receipt_lookups.load(Ordering::Relaxed), 0);
+            assert_eq!(provider.stored(), 0);
+        }
+
+        #[tokio::test]
+        async fn test_used_authorization_after_a_failed_balance_check_answers_the_transaction_found()
+         {
+            // The first settlement can leave the payer without the balance the check wants.
+            let provider = MockProvider::new(true);
+            provider.set_authorization_use(Some(settlement(|_| {})));
+            let sends = AtomicU32::new(0);
+            let tx_hash = settle_eip3009(&provider, Some(authorization()), &sends, || {
+                Err(PaymentVerificationError::InsufficientFunds.into())
+            })
+            .await
+            .unwrap();
+            assert_eq!(tx_hash, FOUND_TX);
+        }
+
+        #[tokio::test]
+        async fn test_transaction_found_with_another_transfer_is_not_the_settlement() {
+            let other = address!("0x9999999999999999999999999999999999999999");
+            let changes: Vec<(&str, ReceiptChange)> = vec![
+                (
+                    "another value",
+                    Box::new(|r| r["logs"][1]["data"] = format!("0x{:064x}", VALUE - 1).into()),
+                ),
+                (
+                    "another recipient",
+                    Box::new(move |r| {
+                        r["logs"][1]["topics"][2] = serde_json::json!(other.into_word())
+                    }),
+                ),
+                (
+                    "another payer",
+                    Box::new(move |r| {
+                        r["logs"][1]["topics"][1] = serde_json::json!(other.into_word())
+                    }),
+                ),
+                (
+                    "a transfer of another token",
+                    Box::new(move |r| r["logs"][1]["address"] = serde_json::json!(other)),
+                ),
+                (
+                    "no transfer",
+                    Box::new(|r| {
+                        r["logs"].as_array_mut().unwrap().pop();
+                    }),
+                ),
+            ];
+            for (case, change) in changes {
+                let provider = MockProvider::new(true);
+                provider.set_authorization_use(Some(settlement(change)));
+                let sends = AtomicU32::new(0);
+                let error = settle_eip3009(&provider, Some(authorization()), &sends, || {
+                    Err(authorization_used_error())
+                })
+                .await
+                .expect_err(case);
+                assert_authorization_used_failure(&error);
+                assert_eq!(provider.authorization_lookups().len(), 1, "{case}");
+            }
+        }
+
+        #[tokio::test]
+        async fn test_transaction_found_that_is_not_ours_or_did_not_use_the_authorization_is_not_the_settlement()
+         {
+            let changes: Vec<(&str, ReceiptChange)> = vec![
+                ("reverted", Box::new(|r| r["status"] = "0x0".into())),
+                (
+                    "sent by another address",
+                    Box::new(|r| {
+                        r["from"] = serde_json::json!(address!(
+                            "0x9999999999999999999999999999999999999999"
+                        ))
+                    }),
+                ),
+                (
+                    "another nonce used",
+                    Box::new(|r| r["logs"][0]["topics"][2] = serde_json::json!(OTHER_REQUEST)),
+                ),
+                (
+                    "no AuthorizationUsed",
+                    Box::new(|r| {
+                        r["logs"].as_array_mut().unwrap().remove(0);
+                    }),
+                ),
+            ];
+            for (case, change) in changes {
+                let provider = MockProvider::new(true);
+                provider.set_authorization_use(Some(settlement(change)));
+                let sends = AtomicU32::new(0);
+                let error = settle_eip3009(&provider, Some(authorization()), &sends, || {
+                    Err(authorization_used_error())
+                })
+                .await
+                .expect_err(case);
+                assert_authorization_used_failure(&error);
+            }
+        }
+
+        #[tokio::test]
+        async fn test_transaction_found_without_its_receipt_is_pending_and_checked_again() {
+            let provider = MockProvider::new(true);
+            provider.set_authorization_use_without_receipt(FOUND_TX);
+            let sends = AtomicU32::new(0);
+            let error = settle_eip3009(&provider, Some(authorization()), &sends, || {
+                Err(authorization_used_error())
+            })
+            .await
+            .unwrap_err();
+            assert_pending_with(&error, FOUND_TX);
+            assert_eq!(provider.stored(), 0, "not recorded: it was not checked");
+            // The next retry looks it up again, and answers once the receipt checks out.
+            provider.set_authorization_use(Some(settlement(|_| {})));
+            let tx_hash = settle_eip3009(&provider, Some(authorization()), &sends, || {
+                Err(authorization_used_error())
+            })
+            .await
+            .unwrap();
+            assert_eq!(tx_hash, FOUND_TX);
+            assert_eq!(provider.authorization_lookups().len(), 2);
+        }
+
+        #[tokio::test]
+        async fn test_used_authorization_not_found_fails_as_before() {
+            let provider = MockProvider::new(true);
+            let sends = AtomicU32::new(0);
+            let error = settle_eip3009(&provider, Some(authorization()), &sends, || {
+                Err(authorization_used_error())
+            })
+            .await
+            .unwrap_err();
+            assert_authorization_used_failure(&error);
+            assert_eq!(provider.authorization_lookups().len(), 1);
+            assert_eq!(provider.stored(), 0);
+        }
+
+        #[tokio::test]
+        async fn test_request_that_does_not_match_its_requirements_is_not_looked_up() {
+            let provider = MockProvider::new(true);
+            provider.set_authorization_use(Some(settlement(|_| {})));
+            let sends = AtomicU32::new(0);
+            let error = settle_eip3009(&provider, None, &sends, || {
+                Err(PaymentVerificationError::RecipientMismatch.into())
+            })
+            .await
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                X402SchemeFacilitatorError::PaymentVerification(
+                    PaymentVerificationError::RecipientMismatch
+                )
+            ));
+            assert!(provider.authorization_lookups().is_empty());
+        }
+
+        #[tokio::test]
+        async fn test_success_and_pending_settlements_are_not_looked_up() {
+            let provider = MockProvider::new(true);
+            provider.set_authorization_use(Some(settlement(|_| {})));
+            let sends = AtomicU32::new(0);
+            let tx_hash = settle_eip3009(&provider, Some(authorization()), &sends, || Ok(OTHER_TX))
+                .await
+                .unwrap();
+            assert_eq!(tx_hash, OTHER_TX);
+            let error = settle_eip3009(&provider, Some(authorization()), &sends, || {
+                Err(receipt_unavailable())
+            })
+            .await
+            .unwrap_err();
+            assert_pending_with(&error, TX_HASH);
+            assert_eq!(provider.stored(), 1, "recorded for the retry, as before");
+            assert!(provider.authorization_lookups().is_empty());
+        }
+
+        #[tokio::test]
+        async fn test_retry_with_a_store_entry_reconciles_without_a_lookup() {
+            let provider = MockProvider::new(true);
+            provider.set_authorization_use(Some(settlement(|_| {})));
+            let sends = AtomicU32::new(0);
+            let _ = settle_eip3009(&provider, Some(authorization()), &sends, || {
+                Err(receipt_unavailable())
+            })
+            .await;
+            provider.set_receipt(Some(receipt(TX_HASH, true)));
+            let tx_hash = settle_eip3009(&provider, Some(authorization()), &sends, || {
+                panic!("a reconciled retry must not settle again")
+            })
+            .await
+            .unwrap();
+            assert_eq!(tx_hash, TX_HASH);
+            assert!(provider.authorization_lookups().is_empty());
+        }
+
+        #[tokio::test]
+        async fn test_same_signature_in_another_matching_request_answers_the_transaction_found() {
+            // The trade-off `reconcile_used_authorizations` documents: with the lookup, a request
+            // that carries a settled signature with other requirements (same network, asset and
+            // recipient, an amount the authorization covers) is answered with the settlement
+            // found on chain instead of failing on the used authorization, and the original
+            // request keeps its store entry for its own retry.
+            let provider = MockProvider::new(true);
+            provider.set_authorization_use(Some(settlement(|_| {})));
+            let sends = AtomicU32::new(0);
+            let error = settle_eip3009(&provider, Some(authorization()), &sends, || {
+                Err(receipt_unavailable())
+            })
+            .await
+            .unwrap_err();
+            assert_pending_with(&error, TX_HASH);
+            let tx_hash = settle_with_pending_store(
+                &provider,
+                SIGNATURE,
+                Some(OTHER_REQUEST),
+                "eip155:84532",
+                || {
+                    sends.fetch_add(1, Ordering::Relaxed);
+                    settle_or_find_used_authorization(&provider, Some(authorization()), async {
+                        Err(authorization_used_error())
+                    })
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(tx_hash, FOUND_TX);
+            assert_eq!(provider.stored(), 1, "the original request keeps its entry");
+            provider.set_receipt(Some(receipt(TX_HASH, true)));
+            let tx_hash = settle_eip3009(&provider, Some(authorization()), &sends, || {
+                panic!("a reconciled retry must not settle again")
+            })
+            .await
+            .unwrap();
+            assert_eq!(tx_hash, TX_HASH);
+            assert_eq!(sends.load(Ordering::Relaxed), 2);
+            assert_eq!(provider.authorization_lookups().len(), 1);
+        }
+
+        #[tokio::test]
+        async fn test_providers_look_nothing_up_by_default() {
+            /// Implements only what the trait requires.
+            struct PlainProvider(RootProvider, Eip155ChainReference);
+            impl Eip155MetaTransactionProvider for PlainProvider {
+                type Error = MetaTransactionSendError;
+                type Inner = RootProvider;
+                fn inner(&self) -> &Self::Inner {
+                    &self.0
+                }
+                fn chain(&self) -> &Eip155ChainReference {
+                    &self.1
+                }
+                async fn send_transaction(
+                    &self,
+                    _tx: MetaTransaction,
+                ) -> Result<TransactionReceipt, Self::Error> {
+                    unreachable!()
+                }
+            }
+            let provider = PlainProvider(
+                RootProvider::new_http("http://127.0.0.1:9".parse().unwrap()),
+                Eip155ChainReference::new(84532),
+            );
+            assert!(
+                provider
+                    .find_authorization_use(authorization())
+                    .await
+                    .is_none()
+            );
+        }
+
+        fn v1_request(
+            pay_to: Address,
+            value: u64,
+            network: &str,
+        ) -> (types::PaymentPayload, types::PaymentRequirements) {
+            let payload = serde_json::from_value(serde_json::json!({
+                "x402Version": 1,
+                "scheme": "exact",
+                "network": "base-sepolia",
+                "payload": {
+                    "signature": "0x1234",
+                    "authorization": {
+                        "from": PAYER,
+                        "to": SELLER,
+                        "value": VALUE.to_string(),
+                        "validAfter": "1000",
+                        "validBefore": "2000",
+                        "nonce": NONCE
+                    }
+                }
+            }))
+            .unwrap();
+            let requirements = serde_json::from_value(serde_json::json!({
+                "scheme": "exact",
+                "network": network,
+                "maxAmountRequired": value.to_string(),
+                "resource": "https://example.com/data",
+                "description": "",
+                "mimeType": "application/json",
+                "payTo": pay_to,
+                "maxTimeoutSeconds": 60,
+                "asset": ASSET,
+                "extra": {"name": "USDC", "version": "2"}
+            }))
+            .unwrap();
+            (payload, requirements)
+        }
+
+        #[test]
+        fn test_v1_request_is_looked_up_only_when_it_matches_its_requirements() {
+            let chain = Eip155ChainReference::new(84532);
+            let (payload, requirements) = v1_request(SELLER, VALUE, "base-sepolia");
+            assert_eq!(
+                authorization_to_reconcile(&chain, &payload, &requirements),
+                Some(authorization())
+            );
+            let (payload, requirements) = v1_request(SELLER, VALUE - 1, "base-sepolia");
+            assert_eq!(
+                authorization_to_reconcile(&chain, &payload, &requirements),
+                Some(authorization()),
+                "paying more than required is accepted, as in verification"
+            );
+            for (pay_to, value, network) in [
+                (
+                    address!("0x9999999999999999999999999999999999999999"),
+                    VALUE,
+                    "base-sepolia",
+                ),
+                (SELLER, VALUE + 1, "base-sepolia"),
+                (SELLER, VALUE, "base"),
+            ] {
+                let (payload, requirements) = v1_request(pay_to, value, network);
+                assert_eq!(
+                    authorization_to_reconcile(&chain, &payload, &requirements),
+                    None,
+                    "{pay_to} {value} {network}"
+                );
+            }
         }
     }
 }

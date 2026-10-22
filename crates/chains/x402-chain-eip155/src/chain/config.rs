@@ -50,6 +50,12 @@ impl Eip155ChainConfig {
         self.inner.receipt_timeout_secs
     }
 
+    /// Returns whether a settle request whose ERC-3009 authorization is already used is
+    /// answered with the transaction that used it.
+    pub fn reconcile_used_authorizations(&self) -> bool {
+        self.inner.reconcile_used_authorizations
+    }
+
     /// Returns the signer configuration for this chain.
     pub fn signers(&self) -> &Eip155SignersConfig {
         &self.inner.signers
@@ -83,6 +89,25 @@ pub struct Eip155ChainConfigInner {
     /// How long to wait till the transaction receipt is available (optional)
     #[serde(default = "eip155_chain_config::default_receipt_timeout_secs")]
     pub receipt_timeout_secs: u64,
+    /// Whether a settle request with no pending-settlement entry, whose ERC-3009 authorization
+    /// is already used, is answered with the transaction that used it (optional, off by
+    /// default).
+    ///
+    /// When on, such a request is looked up on chain: if one of this chain's signers sent a
+    /// transaction in the last five minutes (at most the newest 5,000 blocks) that used the
+    /// authorization and transferred the signed value from the payer to the recipient,
+    /// `/settle` answers success with its hash instead of failing on the used authorization.
+    /// This answers the retry of a settlement that reached another instance, or this one after
+    /// a restart. It also makes `/settle` answer success again, for those five minutes, to any
+    /// other request that carries a settled authorization and matches its requirements.
+    /// Calling `/verify` first protects a resource server only from a copy of the payment that
+    /// arrives after the settlement has landed, because verifying a used authorization fails. A
+    /// copy verified before then that reaches `/settle` after it (one sent while the first
+    /// copy's handler is still running, or at the same time) is answered with the first copy's
+    /// transaction, so the server serves that copy too. Turn it on only when the resource
+    /// servers do not take a `/settle` success alone as proof of a new payment.
+    #[serde(default)]
+    pub reconcile_used_authorizations: bool,
 }
 
 mod eip155_chain_config {
@@ -159,5 +184,26 @@ impl FromStr for EvmPrivateKey {
         B256::from_str(s)
             .map(Self)
             .map_err(|e| format!("Invalid evm private key: {}", e))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(extra: &str) -> Eip155ChainConfigInner {
+        serde_json::from_str(&format!(
+            r#"{{
+                "signers": ["0xcafe000000000000000000000000000000000000000000000000000000000001"],
+                "rpc": [{{"http": "https://sepolia.base.org"}}]{extra}
+            }}"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn test_reconcile_used_authorizations_is_off_unless_set() {
+        assert!(!config("").reconcile_used_authorizations);
+        assert!(config(r#", "reconcile_used_authorizations": true"#).reconcile_used_authorizations);
     }
 }
