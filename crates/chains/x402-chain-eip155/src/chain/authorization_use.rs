@@ -9,14 +9,18 @@
 //! `validBefore`, so a bounded `eth_getLogs` on the asset finds the transaction.
 //!
 //! [`query_authorization_use`] finds the transaction and [`settlement_of_authorization`] checks,
-//! on its receipt, that it is the settlement the request asks for. Permit2 payments are not
-//! covered: their nonces live in the Permit2 contract's bitmap and need their own lookup.
+//! on its receipt, that it is the settlement the request asks for. The search is clamped to what
+//! the RPC answers: it starts no earlier than the lookback before the latest block, whatever the
+//! authorization's validity window, each `eth_getLogs` call covers at most the configured number
+//! of blocks, and a range the RPC refuses is split until it is accepted. Permit2 payments are
+//! not covered: their nonces live in the Permit2 contract's bitmap and need their own lookup.
 
 use alloy_primitives::{Address, B256, TxHash, U256};
 use alloy_provider::Provider;
 use alloy_rpc_types_eth::{BlockNumberOrTag, Filter, TransactionReceipt};
 use alloy_sol_types::SolEvent;
-use alloy_transport::TransportError;
+use alloy_transport::{RpcError, TransportError};
+use std::num::NonZeroU64;
 use std::time::Duration;
 use x402_types::timestamp::UnixTimestamp;
 
@@ -28,13 +32,14 @@ use crate::v1_eip155_exact::{ExactEvmPayloadAuthorization, IEIP3009};
 /// than a store would have kept it, and the logs searched stay a few minutes of blocks.
 pub const AUTHORIZATION_USE_LOOKBACK: Duration = PENDING_SETTLEMENT_TTL;
 
-/// Most blocks one `eth_getLogs` call covers. Longer ranges are split, newest first. Public
-/// endpoints cap the range of a log query (`https://sepolia.base.org` at 200 blocks), and on a
-/// chain with sub-second blocks the lookback spans more than that.
-pub const LOG_QUERY_MAX_BLOCKS: u64 = 100;
+/// Most blocks one `eth_getLogs` call covers unless the chain's configuration sets
+/// `log_query_max_blocks`. Longer ranges are split, newest first. Public endpoints cap the
+/// range of a log query (`https://sepolia.base.org` at 201 blocks), and on a chain with
+/// sub-second blocks the lookback spans more than that.
+pub const LOG_QUERY_MAX_BLOCKS: NonZeroU64 = NonZeroU64::new(100).unwrap();
 
-/// Most `eth_getLogs` calls one lookup makes: the newest `LOG_QUERY_MAX_BLOCKS *
-/// LOG_QUERY_MAX_CALLS` blocks of the range are searched.
+/// Most `eth_getLogs` calls one lookup makes, refused ones included: at most the newest
+/// `LOG_QUERY_MAX_CALLS` times the blocks per call of the range are searched.
 pub const LOG_QUERY_MAX_CALLS: usize = 50;
 
 /// Blocks to step back from the latest block for the first timestamp sample.
@@ -95,6 +100,17 @@ pub enum AuthorizationUseLookupError {
     /// The RPC did not return a block it was asked for.
     #[error("block {0} not found")]
     MissingBlock(BlockNumberOrTag),
+    /// The lookup made [`LOG_QUERY_MAX_CALLS`] `eth_getLogs` calls without finding the use, and
+    /// the older blocks of the range were not searched.
+    #[error(
+        "no use found after {LOG_QUERY_MAX_CALLS} eth_getLogs calls; blocks {from}..={to} not searched"
+    )]
+    CallLimit {
+        /// The oldest block of the range.
+        from: u64,
+        /// The newest block not searched.
+        to: u64,
+    },
 }
 
 /// Looks for the transaction that used `authorization`, and returns its hash.
@@ -103,12 +119,16 @@ pub enum AuthorizationUseLookupError {
 /// the latest block. Reads, in order: `authorizationState` on the asset (one call; nothing more
 /// when the authorization is unused), the latest block, a few block headers to find where the
 /// range starts, and `eth_getLogs` for `AuthorizationUsed(from, nonce)` on the asset over the
-/// blocks that can hold the use (at most [`LOG_QUERY_MAX_BLOCKS`] per call, newest first, and
-/// at most [`LOG_QUERY_MAX_CALLS`] calls).
+/// blocks that can hold the use: at most `max_blocks_per_query` per call, newest first, and at
+/// most [`LOG_QUERY_MAX_CALLS`] calls. When the RPC refuses the block range of a call, the
+/// newer half of that range is queried instead, and later calls keep the smaller size; a
+/// refused single block, or any other error, ends the lookup with that error. Running out of
+/// calls before the oldest block ends it with [`AuthorizationUseLookupError::CallLimit`].
 pub async fn query_authorization_use<P: Provider>(
     provider: &P,
     authorization: &Eip3009Authorization,
     lookback: Duration,
+    max_blocks_per_query: NonZeroU64,
 ) -> Result<Option<TxHash>, AuthorizationUseLookupError> {
     let used = IEIP3009::new(authorization.asset, provider)
         .authorizationState(authorization.from, authorization.nonce)
@@ -120,7 +140,8 @@ pub async fn query_authorization_use<P: Provider>(
 
     let latest = block_header(provider, BlockNumberOrTag::Latest).await?;
     // The use is in a block with a timestamp after `validAfter`, before `validBefore`, and
-    // (by choice) within the lookback.
+    // (by choice) within the lookback. The range ends at the latest block, so a far
+    // `validBefore` does not widen it, and an early `validAfter` is cut at the lookback.
     let lowest_timestamp = authorization
         .valid_after
         .as_secs()
@@ -145,20 +166,59 @@ pub async fn query_authorization_use<P: Provider>(
         .event_signature(IEIP3009::AuthorizationUsed::SIGNATURE_HASH)
         .topic1(authorization.from.into_word())
         .topic2(authorization.nonce);
-    for (from, to) in log_query_ranges(
-        from_block,
-        latest.number,
-        LOG_QUERY_MAX_BLOCKS,
-        LOG_QUERY_MAX_CALLS,
-    ) {
-        let logs = provider
-            .get_logs(&filter.clone().from_block(from).to_block(to))
-            .await?;
+    // Newest first; `end` is the newest block not searched yet.
+    let mut blocks_per_query = max_blocks_per_query.get();
+    let mut end = latest.number;
+    for _ in 0..LOG_QUERY_MAX_CALLS {
+        let start = end.saturating_sub(blocks_per_query - 1).max(from_block);
+        let logs = match provider
+            .get_logs(&filter.clone().from_block(start).to_block(end))
+            .await
+        {
+            Ok(logs) => logs,
+            Err(error) if start < end && is_range_refusal(&error) => {
+                let refused_blocks = end - start + 1;
+                blocks_per_query = refused_blocks / 2;
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        // At most one log matches: an authorization is used once.
         if let Some(tx_hash) = logs.iter().find_map(|log| log.transaction_hash) {
             return Ok(Some(tx_hash));
         }
+        if start == from_block {
+            return Ok(None);
+        }
+        end = start - 1;
     }
-    Ok(None)
+    Err(AuthorizationUseLookupError::CallLimit {
+        from: from_block,
+        to: end,
+    })
+}
+
+/// Whether `error` is the RPC refusing the block range of an `eth_getLogs` call. RPCs refuse it
+/// with different codes and HTTP statuses, and their messages name the range:
+/// `https://sepolia.base.org` answers HTTP 413 with `-32614 eth_getLogs is limited to a 200
+/// range`, publicnode answers HTTP 200 with `-32701 exceed maximum block range: 50000`. Other
+/// errors, a rate limit among them (`https://mainnet.base.org`: HTTP 429 with `-32011 request
+/// limit reached`), are not retried. A cap on the number of results does not arise here: the
+/// filter has both indexed topics, so at most one log matches.
+fn is_range_refusal(error: &TransportError) -> bool {
+    let names_the_range = |message: &str| message.to_ascii_lowercase().contains("range");
+    match error {
+        RpcError::ErrorResp(payload) => names_the_range(&payload.message),
+        // With an HTTP error status, the JSON-RPC error is in the body.
+        RpcError::Transport(kind) => kind.as_http_error().is_some_and(|http| {
+            serde_json::from_str::<serde_json::Value>(&http.body).is_ok_and(|body| {
+                body.pointer("/error/message")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(names_the_range)
+            })
+        }),
+        _ => false,
+    }
 }
 
 /// The settlement `receipt` holds for `authorization`, if it is one: a successful transaction
@@ -281,22 +341,6 @@ where
     }
 }
 
-/// `from..=to` split into ranges of at most `max_blocks` blocks, newest first, and at most
-/// `max_ranges` of them (the newest).
-fn log_query_ranges(from: u64, to: u64, max_blocks: u64, max_ranges: usize) -> Vec<(u64, u64)> {
-    let mut ranges = Vec::new();
-    let mut end = to;
-    while end >= from && ranges.len() < max_ranges {
-        let start = end.saturating_sub(max_blocks - 1).max(from);
-        ranges.push((start, end));
-        if start == 0 {
-            break;
-        }
-        end = start - 1;
-    }
-    ranges
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     //! Also used by the provider's tests: the lookup's inputs and the JSON-RPC answers it reads.
@@ -304,9 +348,10 @@ pub(crate) mod tests {
     use alloy_primitives::{address, b256};
     use alloy_provider::RootProvider;
     use alloy_rpc_client::RpcClient;
-    use alloy_transport::mock::{Asserter, MockTransport};
+    use alloy_transport::mock::{Asserter, MockResponse, MockTransport};
     use serde::Serialize;
     use serde_json::{Value, json};
+    use std::pin::Pin;
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll};
 
@@ -330,7 +375,7 @@ pub(crate) mod tests {
         }
     }
 
-    // ---- block_at_or_before and log_query_ranges ----
+    // ---- block_at_or_before ----
 
     /// Timestamp of block `number` on a chain with one block every `seconds_per_block`, from
     /// block 0 at time 0.
@@ -395,67 +440,85 @@ pub(crate) mod tests {
         assert_eq!(result, Err("HTTP error 503"));
     }
 
-    #[test]
-    fn test_log_ranges_are_split_newest_first() {
-        assert_eq!(log_query_ranges(100, 100, 1_000, 50), vec![(100, 100)]);
-        assert_eq!(
-            log_query_ranges(0, 2_499, 1_000, 50),
-            vec![(1_500, 2_499), (500, 1_499), (0, 499)]
-        );
-        assert_eq!(
-            log_query_ranges(1_000, 2_999, 1_000, 50),
-            vec![(2_000, 2_999), (1_000, 1_999)]
-        );
-    }
-
-    #[test]
-    fn test_log_ranges_keep_the_newest_when_capped() {
-        assert_eq!(
-            log_query_ranges(0, 9_999, 100, 3),
-            vec![(9_900, 9_999), (9_800, 9_899), (9_700, 9_799)]
-        );
-    }
-
     // ---- query_authorization_use against a mock RPC ----
 
-    /// Passes requests to the mock transport and keeps each one, as JSON, for the test to read.
+    /// An error the RPC answers to a request, instead of the mock transport, or `None`.
+    type Refusal = Arc<dyn Fn(&Value) -> Option<TransportError> + Send + Sync>;
+
+    /// Keeps each request, as JSON, for the test to read, answers the ones `refuse` refuses with
+    /// its error, and passes the others to the mock transport.
     #[derive(Clone)]
     struct Recorded<S> {
         inner: S,
         requests: Arc<Mutex<Vec<Value>>>,
+        refuse: Refusal,
     }
 
     impl<S, R> tower::Service<R> for Recorded<S>
     where
-        S: tower::Service<R>,
+        S: tower::Service<R, Error = TransportError>,
+        S::Response: Send + 'static,
+        S::Future: Send + 'static,
         R: Serialize,
     {
         type Response = S::Response;
-        type Error = S::Error;
-        type Future = S::Future;
+        type Error = TransportError;
+        type Future = Pin<Box<dyn Future<Output = Result<S::Response, TransportError>> + Send>>;
 
         fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
             self.inner.poll_ready(cx)
         }
 
         fn call(&mut self, request: R) -> Self::Future {
-            self.requests
-                .lock()
-                .unwrap()
-                .push(serde_json::to_value(&request).unwrap());
-            self.inner.call(request)
+            let json = serde_json::to_value(&request).unwrap();
+            let refusal = (self.refuse)(&json);
+            self.requests.lock().unwrap().push(json);
+            match refusal {
+                Some(error) => Box::pin(std::future::ready(Err(error))),
+                None => Box::pin(self.inner.call(request)),
+            }
         }
     }
 
     fn mock_rpc() -> (RootProvider, Asserter, Arc<Mutex<Vec<Value>>>) {
+        mock_rpc_refusing(|_| None)
+    }
+
+    fn mock_rpc_refusing(
+        refuse: impl Fn(&Value) -> Option<TransportError> + Send + Sync + 'static,
+    ) -> (RootProvider, Asserter, Arc<Mutex<Vec<Value>>>) {
         let asserter = Asserter::new();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let transport = Recorded {
             inner: MockTransport::new(asserter.clone()),
             requests: requests.clone(),
+            refuse: Arc::new(refuse),
         };
         let provider = RootProvider::new(RpcClient::new(transport, true));
         (provider, asserter, requests)
+    }
+
+    fn block_number(value: &Value) -> u64 {
+        u64::from_str_radix(value.as_str().unwrap().trim_start_matches("0x"), 16).unwrap()
+    }
+
+    /// `https://sepolia.base.org`'s answer to an `eth_getLogs` over more than 201 blocks
+    /// (`toBlock - fromBlock` above 200).
+    fn base_sepolia_log_range_cap(request: &Value) -> Option<TransportError> {
+        let filter = &request["params"][0];
+        let refused = request["method"] == "eth_getLogs"
+            && block_number(&filter["toBlock"]) - block_number(&filter["fromBlock"]) > 200;
+        refused.then(|| {
+            alloy_transport::TransportErrorKind::http_error(
+                413,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": request["id"],
+                    "error": {"code": -32614, "message": "eth_getLogs is limited to a 200 range"}
+                })
+                .to_string(),
+            )
+        })
     }
 
     fn methods(requests: &Mutex<Vec<Value>>) -> Vec<String> {
@@ -465,6 +528,40 @@ pub(crate) mod tests {
             .iter()
             .map(|request| request["method"].as_str().unwrap().to_string())
             .collect()
+    }
+
+    /// The `fromBlock..=toBlock` of each `eth_getLogs` request, in order.
+    fn log_ranges(requests: &Mutex<Vec<Value>>) -> Vec<(u64, u64)> {
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request["method"] == "eth_getLogs")
+            .map(|request| {
+                let filter = &request["params"][0];
+                (
+                    block_number(&filter["fromBlock"]),
+                    block_number(&filter["toBlock"]),
+                )
+            })
+            .collect()
+    }
+
+    /// Pushes a JSON-RPC error answer.
+    fn push_rpc_error(asserter: &Asserter, code: i64, message: &str) {
+        asserter.push(MockResponse::Failure(
+            serde_json::from_value(json!({ "code": code, "message": message })).unwrap(),
+        ));
+    }
+
+    /// The answers up to the first `eth_getLogs` for a used authorization on a chain with a
+    /// block every 0.2 s (Base Sepolia): the latest block is 10,000 at time 2,000, and the five
+    /// minutes back reach block 8,500, so the range is 8,499..=10,000, 1,502 blocks.
+    fn push_used_on_a_fast_chain(asserter: &Asserter) {
+        asserter.push_success(&abi_bool(true));
+        asserter.push_success(&block(10_000, 2_000));
+        asserter.push_success(&block(9_984, 1_996));
+        asserter.push_success(&block(8_499, 1_699));
     }
 
     pub(crate) fn abi_bool(value: bool) -> String {
@@ -521,6 +618,7 @@ pub(crate) mod tests {
             &provider,
             &authorization(0, u64::MAX),
             AUTHORIZATION_USE_LOOKBACK,
+            LOG_QUERY_MAX_BLOCKS,
         )
         .await
         .unwrap();
@@ -544,6 +642,7 @@ pub(crate) mod tests {
             &provider,
             &authorization(19_500, 20_300),
             AUTHORIZATION_USE_LOOKBACK,
+            LOG_QUERY_MAX_BLOCKS,
         )
         .await
         .unwrap();
@@ -591,6 +690,7 @@ pub(crate) mod tests {
             &provider,
             &authorization(19_500, 20_300),
             AUTHORIZATION_USE_LOOKBACK,
+            LOG_QUERY_MAX_BLOCKS,
         )
         .await
         .unwrap();
@@ -623,11 +723,128 @@ pub(crate) mod tests {
             &provider,
             &authorization(19_000, 19_600),
             AUTHORIZATION_USE_LOOKBACK,
+            LOG_QUERY_MAX_BLOCKS,
         )
         .await
         .unwrap();
         assert!(found.is_none());
         assert_eq!(methods(&requests), vec!["eth_call", "eth_getBlockByNumber"]);
+    }
+
+    #[tokio::test]
+    async fn test_refused_range_is_halved_until_the_rpc_takes_it() {
+        // Configured for 1,000 blocks per call, against an RPC that takes at most 201.
+        let (provider, asserter, requests) = mock_rpc_refusing(base_sepolia_log_range_cap);
+        push_used_on_a_fast_chain(&asserter);
+        asserter.push_success(&Vec::<Value>::new());
+        asserter.push_success(&Vec::<Value>::new());
+        asserter.push_success(&vec![authorization_used_log(9_700)]);
+        let found = query_authorization_use(
+            &provider,
+            &authorization(1_000, 2_300),
+            AUTHORIZATION_USE_LOOKBACK,
+            NonZeroU64::new(1_000).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(found, Some(TX));
+        assert_eq!(
+            log_ranges(&requests),
+            vec![
+                (9_001, 10_000), // refused
+                (9_501, 10_000), // refused
+                (9_751, 10_000), // refused
+                (9_876, 10_000),
+                // The rest of the range keeps the size the RPC took.
+                (9_751, 9_875),
+                (9_626, 9_750),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_refused_single_block_ends_the_lookup_with_the_error() {
+        let (provider, asserter, requests) = mock_rpc();
+        push_used_on_a_fast_chain(&asserter);
+        for _ in 0..7 {
+            push_rpc_error(&asserter, -32602, "block range too large");
+        }
+        let result = query_authorization_use(
+            &provider,
+            &authorization(1_000, 2_300),
+            AUTHORIZATION_USE_LOOKBACK,
+            LOG_QUERY_MAX_BLOCKS,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(AuthorizationUseLookupError::Transport(_))
+        ));
+        let sizes: Vec<u64> = log_ranges(&requests)
+            .iter()
+            .map(|(from, to)| to - from + 1)
+            .collect();
+        assert_eq!(sizes, vec![100, 50, 25, 12, 6, 3, 1]);
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_other_log_query_errors_are_not_retried() {
+        // `https://mainnet.base.org` rate-limiting.
+        let (provider, asserter, requests) = mock_rpc_refusing(|request| {
+            (request["method"] == "eth_getLogs").then(|| {
+                alloy_transport::TransportErrorKind::http_error(
+                    429,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": request["id"],
+                        "error": {"code": -32011, "message": "request limit reached"}
+                    })
+                    .to_string(),
+                )
+            })
+        });
+        push_used_on_a_fast_chain(&asserter);
+        let result = query_authorization_use(
+            &provider,
+            &authorization(1_000, 2_300),
+            AUTHORIZATION_USE_LOOKBACK,
+            LOG_QUERY_MAX_BLOCKS,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(AuthorizationUseLookupError::Transport(_))
+        ));
+        assert_eq!(log_ranges(&requests), vec![(9_901, 10_000)]);
+    }
+
+    #[tokio::test]
+    async fn test_lookup_stops_at_the_call_limit_with_the_newest_blocks_searched() {
+        let (provider, asserter, requests) = mock_rpc();
+        push_used_on_a_fast_chain(&asserter);
+        // 10 blocks per call: 50 calls cover 500 of the 1,502 blocks.
+        for _ in 0..LOG_QUERY_MAX_CALLS {
+            asserter.push_success(&Vec::<Value>::new());
+        }
+        let result = query_authorization_use(
+            &provider,
+            &authorization(1_000, 2_300),
+            AUTHORIZATION_USE_LOOKBACK,
+            NonZeroU64::new(10).unwrap(),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(AuthorizationUseLookupError::CallLimit {
+                from: 8_499,
+                to: 9_500
+            })
+        ));
+        let ranges = log_ranges(&requests);
+        assert_eq!(ranges.len(), LOG_QUERY_MAX_CALLS);
+        assert_eq!(ranges.first(), Some(&(9_991, 10_000)));
+        assert_eq!(ranges.last(), Some(&(9_501, 9_510)));
     }
 
     #[tokio::test]
@@ -639,6 +856,7 @@ pub(crate) mod tests {
             &provider,
             &authorization(0, u64::MAX),
             AUTHORIZATION_USE_LOOKBACK,
+            LOG_QUERY_MAX_BLOCKS,
         )
         .await;
         assert!(matches!(

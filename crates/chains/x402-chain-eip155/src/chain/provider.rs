@@ -13,7 +13,7 @@ use alloy_signer_local::PrivateKeySigner;
 use alloy_transport::TransportError;
 use alloy_transport::layers::{FallbackLayer, ThrottleLayer};
 use alloy_transport_http::Http;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::ops::Deref;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
@@ -104,6 +104,8 @@ pub struct Eip155ChainProvider {
     pending_settlements: Arc<InMemoryPendingSettlementStore>,
     /// Whether [`Eip155MetaTransactionProvider::find_authorization_use`] looks on chain.
     reconcile_used_authorizations: bool,
+    /// Most blocks one `eth_getLogs` call of that lookup covers.
+    log_query_max_blocks: NonZeroU64,
 }
 
 impl Eip155ChainProvider {
@@ -300,6 +302,7 @@ impl FromConfig<Eip155ChainConfig> for Eip155ChainProvider {
             nonce_manager,
             pending_settlements: Arc::new(InMemoryPendingSettlementStore::default()),
             reconcile_used_authorizations: config.reconcile_used_authorizations(),
+            log_query_max_blocks: config.log_query_max_blocks(),
         })
     }
 }
@@ -452,9 +455,9 @@ impl Eip155MetaTransactionProvider for Eip155ChainProvider {
     }
 
     /// Looks the use of `authorization` up on chain when `reconcile_used_authorizations` is
-    /// set in the chain's configuration, within [`AUTHORIZATION_USE_LOOKBACK`], then waits for
-    /// the receipt of the transaction found as [`Self::find_receipt`] does. A failed lookup counts
-    /// as not found.
+    /// set in the chain's configuration, within [`AUTHORIZATION_USE_LOOKBACK`] and with at most
+    /// `log_query_max_blocks` blocks per `eth_getLogs` call, then waits for the receipt of the
+    /// transaction found as [`Self::find_receipt`] does. A failed lookup counts as not found.
     async fn find_authorization_use(
         &self,
         authorization: Eip3009Authorization,
@@ -466,6 +469,7 @@ impl Eip155MetaTransactionProvider for Eip155ChainProvider {
             &self.inner,
             &authorization,
             AUTHORIZATION_USE_LOOKBACK,
+            self.log_query_max_blocks,
         )
         .await
         {
@@ -762,6 +766,7 @@ mod tests {
 
     mod authorization_use {
         use super::*;
+        use crate::chain::authorization_use::LOG_QUERY_MAX_BLOCKS;
         use crate::chain::authorization_use::tests::{
             ASSET, PAYER, TX, abi_bool, authorization, authorization_used_log, block,
         };
@@ -772,6 +777,18 @@ mod tests {
         fn provider(
             asserter: &Asserter,
             reconcile_used_authorizations: bool,
+        ) -> Eip155ChainProvider {
+            provider_with_log_range(
+                asserter,
+                reconcile_used_authorizations,
+                LOG_QUERY_MAX_BLOCKS,
+            )
+        }
+
+        fn provider_with_log_range(
+            asserter: &Asserter,
+            reconcile_used_authorizations: bool,
+            log_query_max_blocks: NonZeroU64,
         ) -> Eip155ChainProvider {
             let signer = PrivateKeySigner::from_bytes(&b256!(
                 "0xcafe000000000000000000000000000000000000000000000000000000000001"
@@ -804,6 +821,7 @@ mod tests {
                 nonce_manager,
                 pending_settlements: Arc::new(InMemoryPendingSettlementStore::default()),
                 reconcile_used_authorizations,
+                log_query_max_blocks,
             }
         }
 
@@ -858,6 +876,27 @@ mod tests {
             let receipt = found.receipt.expect("its receipt");
             assert_eq!(receipt.transaction_hash, TX);
             assert_eq!(receipt.logs()[0].topics()[1], PAYER.into_word());
+            assert!(asserter.read_q().is_empty());
+        }
+
+        #[tokio::test]
+        async fn test_lookup_queries_logs_in_ranges_of_the_configured_size() {
+            let asserter = Asserter::new();
+            asserter.push_success(&abi_bool(true));
+            asserter.push_success(&block(100, 1_000));
+            // The authorization became valid at time 996: the range is 84..=100, 17 blocks.
+            asserter.push_success(&block(84, 968));
+            // With 10 blocks per call, 91..=100 has nothing and 84..=90 has the use; with the
+            // default 100, one call over 84..=100 would get the first answer and stop there.
+            asserter.push_success(&Vec::<serde_json::Value>::new());
+            asserter.push_success(&vec![authorization_used_log(85)]);
+            asserter.push_success(&receipt_of(TX));
+            let found = provider_with_log_range(&asserter, true, NonZeroU64::new(10).unwrap())
+                .find_authorization_use(authorization(996, 2_000))
+                .await
+                .expect("the transaction that used the authorization");
+            assert_eq!(found.tx_hash, TX);
+            assert!(found.receipt.is_some());
             assert!(asserter.read_q().is_empty());
         }
 
